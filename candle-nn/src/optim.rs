@@ -59,8 +59,6 @@ impl Optimizer for SGD {
         for var in self.vars.iter() {
             if let Some(grad) = grads.get(var) {
                 var.set(&var.sub(&(grad * self.learning_rate)?)?)?;
-            } else {
-                println!("MISSING GRAD FOR {:?}", var.id());
             }
         }
         Ok(())

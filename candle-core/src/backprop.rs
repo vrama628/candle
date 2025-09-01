@@ -190,7 +190,6 @@ impl Tensor {
                 true
             });
             if node.is_variable() {
-                println!("holding onto gradient for tensor {:?}", node.id());
                 continue;
             }
             let grad = grads
@@ -763,7 +762,6 @@ impl<const N: usize, F: Fn([&Tensor; N]) -> Result<Tensor> + Sync + Send> Replay
     }
 
     fn replay(&self) -> Result<Tensor> {
-        println!("REPLAYING {:?}", self.input);
         (self.f)(self.input.each_ref())
     }
 }
