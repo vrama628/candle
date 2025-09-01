@@ -1,7 +1,9 @@
 //! Methods for backpropagation of gradients.
-use crate::op::{BinaryOp, Op, ReduceOp, UnaryOp};
-use crate::{Error, Result, Tensor, TensorId};
-use std::collections::HashMap;
+use crate::op::{BackpropOp, BinaryOp, Op, ReduceOp, UnaryOp};
+use crate::{Error, Module, Result, Tensor, TensorId};
+use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
+use std::{collections::HashMap, fmt::Debug};
 
 // arg has been reduced to node via reduce_dims, expand it back to arg.
 // This has to handle keepdims.
@@ -27,149 +29,172 @@ thread_local! {
     }
 }
 
+// The vec of sorted nodes is passed as an owned value rather than a mutable reference
+// to get around some lifetime limitations.
+fn walk<'a>(
+    node: &'a Tensor,
+    nodes: Vec<Tensor>,
+    already_seen: &mut HashMap<TensorId, bool>,
+) -> (bool, Vec<Tensor>) {
+    if let Some(&tg) = already_seen.get(&node.id()) {
+        return (tg, nodes);
+    }
+    let mut track_grad = false;
+    let mut nodes = if node.is_variable() {
+        // Do not call recursively on the "leaf" nodes.
+        track_grad = true;
+        nodes
+    } else if node.dtype().is_int() {
+        nodes
+    } else {
+        match node.op() {
+            BackpropOp::Op(op) => match op {
+                Op::IndexAdd(t1, t2, t3, _)
+                | Op::ScatterAdd(t1, t2, t3, _)
+                | Op::CustomOp3(t1, t2, t3, _)
+                | Op::WhereCond(t1, t2, t3) => {
+                    let (tg, nodes) = walk(t1, nodes, already_seen);
+                    track_grad |= tg;
+                    let (tg, nodes) = walk(t2, nodes, already_seen);
+                    track_grad |= tg;
+                    let (tg, nodes) = walk(t3, nodes, already_seen);
+                    track_grad |= tg;
+                    nodes
+                }
+                Op::Conv1D {
+                    arg: lhs,
+                    kernel: rhs,
+                    ..
+                }
+                | Op::ConvTranspose1D {
+                    arg: lhs,
+                    kernel: rhs,
+                    ..
+                }
+                | Op::Conv2D {
+                    arg: lhs,
+                    kernel: rhs,
+                    ..
+                }
+                | Op::ConvTranspose2D {
+                    arg: lhs,
+                    kernel: rhs,
+                    ..
+                }
+                | Op::CustomOp2(lhs, rhs, _)
+                | Op::Binary(lhs, rhs, _)
+                | Op::Gather(lhs, rhs, _)
+                | Op::IndexSelect(lhs, rhs, _)
+                | Op::Matmul(lhs, rhs)
+                | Op::SliceScatter0(lhs, rhs, _) => {
+                    let (tg, nodes) = walk(lhs, nodes, already_seen);
+                    track_grad |= tg;
+                    let (tg, nodes) = walk(rhs, nodes, already_seen);
+                    track_grad |= tg;
+                    nodes
+                }
+                Op::Cat(args, _) => args.iter().fold(nodes, |nodes, arg| {
+                    let (tg, nodes) = walk(arg, nodes, already_seen);
+                    track_grad |= tg;
+                    nodes
+                }),
+                Op::Affine { arg, mul, .. } => {
+                    if *mul == 0. {
+                        nodes
+                    } else {
+                        let (tg, nodes) = walk(arg, nodes, already_seen);
+                        track_grad |= tg;
+                        nodes
+                    }
+                }
+                Op::Unary(_node, UnaryOp::Ceil)
+                | Op::Unary(_node, UnaryOp::Floor)
+                | Op::Unary(_node, UnaryOp::Round)
+                | Op::Unary(_node, UnaryOp::Sign) => nodes,
+                Op::Reshape(node)
+                | Op::UpsampleNearest1D { arg: node, .. }
+                | Op::UpsampleNearest2D { arg: node, .. }
+                | Op::AvgPool2D { arg: node, .. }
+                | Op::MaxPool2D { arg: node, .. }
+                | Op::Copy(node)
+                | Op::Broadcast(node)
+                | Op::Cmp(node, _)
+                | Op::Reduce(node, ReduceOp::Min | ReduceOp::Sum | ReduceOp::Max, _)
+                | Op::ToDevice(node)
+                | Op::Transpose(node, _, _)
+                | Op::Permute(node, _)
+                | Op::Narrow(node, _, _, _)
+                | Op::Unary(node, _)
+                | Op::Elu(node, _)
+                | Op::Powf(node, _)
+                | Op::CustomOp1(node, _) => {
+                    let (tg, nodes) = walk(node, nodes, already_seen);
+                    track_grad |= tg;
+                    nodes
+                }
+                Op::ToDType(node) => {
+                    if node.dtype().is_float() {
+                        let (tg, nodes) = walk(node, nodes, already_seen);
+                        track_grad |= tg;
+                        nodes
+                    } else {
+                        nodes
+                    }
+                }
+                Op::Reduce(_, ReduceOp::ArgMin | ReduceOp::ArgMax, _) => nodes,
+            },
+            BackpropOp::Replay(replayer) => {
+                replayer.input().iter().fold(nodes, |nodes, arg| {
+                    let (_tg, nodes) = walk(arg, nodes, already_seen);
+                    track_grad = true; // we only would have stored BackpropOp::Replay if we had to track the gradient
+                    nodes
+                })
+            }
+            BackpropOp::None => nodes,
+        }
+    };
+    already_seen.insert(node.id(), track_grad);
+    if track_grad {
+        nodes.push(node.clone());
+    }
+    (track_grad, nodes)
+}
+
 impl Tensor {
     /// Return all the nodes that lead to this value in a topologically sorted vec, the first
     /// elements having dependencies on the latter ones, e.g. the first element if any is the
     /// argument.
     /// This assumes that the op graph is a DAG.
-    pub fn sorted_nodes(&self) -> Vec<&Tensor> {
-        // The vec of sorted nodes is passed as an owned value rather than a mutable reference
-        // to get around some lifetime limitations.
-        fn walk<'a>(
-            node: &'a Tensor,
-            nodes: Vec<&'a Tensor>,
-            already_seen: &mut HashMap<TensorId, bool>,
-        ) -> (bool, Vec<&'a Tensor>) {
-            if let Some(&tg) = already_seen.get(&node.id()) {
-                return (tg, nodes);
-            }
-            let mut track_grad = false;
-            let mut nodes = if node.is_variable() {
-                // Do not call recursively on the "leaf" nodes.
-                track_grad = true;
-                nodes
-            } else if node.dtype().is_int() {
-                nodes
-            } else if let Some(op) = node.op() {
-                match op {
-                    Op::IndexAdd(t1, t2, t3, _)
-                    | Op::ScatterAdd(t1, t2, t3, _)
-                    | Op::CustomOp3(t1, t2, t3, _)
-                    | Op::WhereCond(t1, t2, t3) => {
-                        let (tg, nodes) = walk(t1, nodes, already_seen);
-                        track_grad |= tg;
-                        let (tg, nodes) = walk(t2, nodes, already_seen);
-                        track_grad |= tg;
-                        let (tg, nodes) = walk(t3, nodes, already_seen);
-                        track_grad |= tg;
-                        nodes
-                    }
-                    Op::Conv1D {
-                        arg: lhs,
-                        kernel: rhs,
-                        ..
-                    }
-                    | Op::ConvTranspose1D {
-                        arg: lhs,
-                        kernel: rhs,
-                        ..
-                    }
-                    | Op::Conv2D {
-                        arg: lhs,
-                        kernel: rhs,
-                        ..
-                    }
-                    | Op::ConvTranspose2D {
-                        arg: lhs,
-                        kernel: rhs,
-                        ..
-                    }
-                    | Op::CustomOp2(lhs, rhs, _)
-                    | Op::Binary(lhs, rhs, _)
-                    | Op::Gather(lhs, rhs, _)
-                    | Op::IndexSelect(lhs, rhs, _)
-                    | Op::Matmul(lhs, rhs)
-                    | Op::SliceScatter0(lhs, rhs, _) => {
-                        let (tg, nodes) = walk(lhs, nodes, already_seen);
-                        track_grad |= tg;
-                        let (tg, nodes) = walk(rhs, nodes, already_seen);
-                        track_grad |= tg;
-                        nodes
-                    }
-                    Op::Cat(args, _) => args.iter().fold(nodes, |nodes, arg| {
-                        let (tg, nodes) = walk(arg, nodes, already_seen);
-                        track_grad |= tg;
-                        nodes
-                    }),
-                    Op::Affine { arg, mul, .. } => {
-                        if *mul == 0. {
-                            nodes
-                        } else {
-                            let (tg, nodes) = walk(arg, nodes, already_seen);
-                            track_grad |= tg;
-                            nodes
-                        }
-                    }
-                    Op::Unary(_node, UnaryOp::Ceil)
-                    | Op::Unary(_node, UnaryOp::Floor)
-                    | Op::Unary(_node, UnaryOp::Round)
-                    | Op::Unary(_node, UnaryOp::Sign) => nodes,
-                    Op::Reshape(node)
-                    | Op::UpsampleNearest1D { arg: node, .. }
-                    | Op::UpsampleNearest2D { arg: node, .. }
-                    | Op::AvgPool2D { arg: node, .. }
-                    | Op::MaxPool2D { arg: node, .. }
-                    | Op::Copy(node)
-                    | Op::Broadcast(node)
-                    | Op::Cmp(node, _)
-                    | Op::Reduce(node, ReduceOp::Min | ReduceOp::Sum | ReduceOp::Max, _)
-                    | Op::ToDevice(node)
-                    | Op::Transpose(node, _, _)
-                    | Op::Permute(node, _)
-                    | Op::Narrow(node, _, _, _)
-                    | Op::Unary(node, _)
-                    | Op::Elu(node, _)
-                    | Op::Powf(node, _)
-                    | Op::CustomOp1(node, _) => {
-                        let (tg, nodes) = walk(node, nodes, already_seen);
-                        track_grad |= tg;
-                        nodes
-                    }
-                    Op::ToDType(node) => {
-                        if node.dtype().is_float() {
-                            let (tg, nodes) = walk(node, nodes, already_seen);
-                            track_grad |= tg;
-                            nodes
-                        } else {
-                            nodes
-                        }
-                    }
-                    Op::Reduce(_, ReduceOp::ArgMin | ReduceOp::ArgMax, _) => nodes,
-                }
-            } else {
-                nodes
-            };
-            already_seen.insert(node.id(), track_grad);
-            if track_grad {
-                nodes.push(node);
-            }
-            (track_grad, nodes)
-        }
+    pub fn sorted_nodes(&self) -> Vec<Tensor> {
         let (_tg, mut nodes) = walk(self, vec![], &mut HashMap::new());
         nodes.reverse();
         nodes
     }
 
     pub fn backward(&self) -> Result<GradStore> {
-        let sorted_nodes = self.sorted_nodes();
+        let mut already_seen = HashMap::new();
+        let (_, mut sorted_nodes) = walk(self, vec![], &mut already_seen);
         let mut grads = GradStore::new();
         grads.insert(self, self.ones_like()?.contiguous()?);
-        for node in sorted_nodes.iter() {
+        while let Some(ref node) = sorted_nodes.pop() {
+            // loop through grads --
+            // - if !track_grad, drop
+            // - if op is non-none, detach
+            grads.0.retain(|id, grad| {
+                if !already_seen[id] {
+                    return false;
+                }
+                if !grad.op().is_none() {
+                    *grad = grad.detach();
+                }
+                true
+            });
             if node.is_variable() {
+                println!("holding onto gradient for tensor {:?}", node.id());
                 continue;
             }
             let grad = grads
-                .remove(node)
+                .remove(&node)
                 .expect("candle internal error - grad not populated");
             // https://github.com/huggingface/candle/issues/1241
             // Ideally, we would make these operations in place where possible to ensure that we
@@ -178,8 +203,8 @@ impl Tensor {
             // derivatives but these are out of scope at the moment.
             let do_not_detach = CANDLE_GRAD_DO_NOT_DETACH.with(|b| *b);
             let grad = if do_not_detach { grad } else { grad.detach() };
-            if let Some(op) = node.op() {
-                match op {
+            match node.op() {
+                BackpropOp::Op(op) => match op {
                     Op::Binary(lhs, rhs, BinaryOp::Add) => {
                         let lhs_sum_grad = grads.or_insert(lhs)?;
                         *lhs_sum_grad = lhs_sum_grad.add(&grad)?;
@@ -541,7 +566,7 @@ impl Tensor {
                     }
                     Op::Unary(arg, UnaryOp::Exp) => {
                         let sum_grad = grads.or_insert(arg)?;
-                        *sum_grad = sum_grad.add(&(&grad * *node)?)?
+                        *sum_grad = sum_grad.add(&(&grad * node)?)?
                     }
                     Op::Unary(arg, UnaryOp::Neg) => {
                         let sum_grad = grads.or_insert(arg)?;
@@ -625,7 +650,7 @@ impl Tensor {
                         let sum_grad = grads.or_insert(arg)?;
                         // d/dx silu = sigmoid(x) * (1 + x * (1 - sigmoid(x))) = sigmoid(x) * (1 - node) + node
                         let sigmoid_arg = (arg.neg()?.exp()? + 1.)?.recip()?;
-                        let silu_grad = &sigmoid_arg * (1. - *node) + *node;
+                        let silu_grad = &sigmoid_arg * (1. - node) + node;
                         *sum_grad = sum_grad.add(&(&grad * silu_grad)?)?
                     }
                     Op::Elu(arg, alpha) => {
@@ -635,7 +660,7 @@ impl Tensor {
                         let positive_mask = arg.gt(&zeros)?.to_dtype(arg.dtype())?;
                         let negative_mask = arg.le(&zeros)?.to_dtype(arg.dtype())?;
                         // node == alpha * (e^x - 1) for x <= 0, reuse it
-                        let negative_exp_mask = (negative_mask * (*node + *alpha))?;
+                        let negative_exp_mask = (negative_mask * (node + *alpha))?;
                         let combined_mask = (positive_mask + negative_exp_mask)?;
                         *sum_grad = sum_grad.add(&(grad * combined_mask)?)?
                     }
@@ -706,10 +731,68 @@ impl Tensor {
                         let sum_grad = grads.or_insert(arg)?;
                         *sum_grad = sum_grad.add(&arg_grad)?
                     }
-                };
+                },
+                BackpropOp::Replay(replayer) => {
+                    let res = replayer.replay()?;
+                    let (_, nodes) = walk(&res, sorted_nodes, &mut already_seen);
+                    sorted_nodes = nodes;
+                    grads.insert(&res, grad);
+                }
+                BackpropOp::None => (),
             }
         }
         Ok(grads)
+    }
+}
+
+struct Replayer<const N: usize, F> {
+    f: F,
+    input: [Tensor; N],
+}
+
+pub(crate) trait Replayable: Sync + Send {
+    fn input(&self) -> &[Tensor];
+    fn replay(&self) -> Result<Tensor>;
+}
+
+impl<const N: usize, F: Fn([&Tensor; N]) -> Result<Tensor> + Sync + Send> Replayable
+    for Replayer<N, F>
+{
+    fn input(&self) -> &[Tensor] {
+        &self.input
+    }
+
+    fn replay(&self) -> Result<Tensor> {
+        println!("REPLAYING {:?}", self.input);
+        (self.f)(self.input.each_ref())
+    }
+}
+
+pub fn checkpoint<const N: usize>(
+    f: impl Fn([&Tensor; N]) -> Result<Tensor> + Sync + Send + 'static,
+    input: [&Tensor; N],
+) -> Result<Tensor> {
+    let res = f(input)?;
+    let op = if res.op().is_none() {
+        BackpropOp::none()
+    } else {
+        let replayer = Replayer {
+            f,
+            input: input.map(Clone::clone),
+        };
+        BackpropOp::Replay(Box::new(replayer))
+    };
+    Ok(res.with_op(op))
+}
+
+pub struct Checkpointed<M: Module + Clone + Send + Sync + 'static> {
+    inner: M,
+}
+
+impl<M: Module + Clone + Send + Sync + 'static> Module for Checkpointed<M> {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let inner = self.inner.clone();
+        checkpoint(move |[x]| inner.forward(x), [x])
     }
 }
 

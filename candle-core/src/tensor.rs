@@ -536,7 +536,7 @@ impl Tensor {
     /// Returns true if the computation graph should track this op, that is if it is
     /// a variable or if it has some variable as dependencies.
     pub fn track_op(&self) -> bool {
-        self.is_variable || self.op.is_some()
+        self.is_variable || !self.op.is_none()
     }
 
     // TODO: Also make an inplace version or a pre-allocated? This could be tricky
@@ -1756,7 +1756,7 @@ impl Tensor {
         self.is_variable
     }
 
-    pub(crate) fn op(&self) -> &Option<Op> {
+    pub(crate) fn op(&self) -> &BackpropOp {
         &self.op
     }
 
@@ -2019,6 +2019,19 @@ impl Tensor {
         Ok(Tensor(Arc::new(tensor_)))
     }
 
+    pub(crate) fn with_op(&self, op: BackpropOp) -> Tensor {
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout: self.layout.clone(),
+            op,
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Tensor(Arc::new(tensor_))
+    }
+
     /// Returns a new tensor detached from the current graph, gradient are not propagated through
     /// this new node. The storage of this tensor is shared with the initial tensor.
     ///
@@ -2027,16 +2040,7 @@ impl Tensor {
         if self.op.is_none() && !self.is_variable {
             self.clone()
         } else {
-            let tensor_ = Tensor_ {
-                id: TensorId::new(),
-                storage: self.storage.clone(),
-                layout: self.layout.clone(),
-                op: BackpropOp::none(),
-                is_variable: false,
-                dtype: self.dtype,
-                device: self.device.clone(),
-            };
-            Tensor(Arc::new(tensor_))
+            self.with_op(BackpropOp::none())
         }
     }
 

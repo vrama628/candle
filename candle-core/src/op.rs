@@ -1,11 +1,11 @@
 //! Tensor Opertion Enums and Traits
 //!
 #![allow(clippy::redundant_closure_call)]
-use crate::Tensor;
+use crate::{backprop::Replayable, Tensor};
 use half::{bf16, f16};
 use num_traits::float::Float;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -868,30 +868,32 @@ impl UnaryOpT for Relu {
 
 /// `BackpropOp` is a wrapper around `Option<Op>`. The main goal is to ensure that dependencies are
 /// properly checked when creating a new value
-#[derive(Clone)]
-pub struct BackpropOp(Option<Op>);
+// #[derive(Clone)]
+pub enum BackpropOp {
+    None,
+    Op(Op),
+    Replay(Box<dyn Replayable>),
+}
 
 impl BackpropOp {
     pub(crate) fn none() -> Self {
-        BackpropOp(None)
+        Self::None
     }
 
     pub(crate) fn new1(arg: &Tensor, f: impl Fn(Tensor) -> Op) -> Self {
-        let op = if arg.track_op() {
-            Some(f(arg.clone()))
+        if arg.track_op() {
+            Self::Op(f(arg.clone()))
         } else {
-            None
-        };
-        Self(op)
+            Self::None
+        }
     }
 
     pub(crate) fn new2(arg1: &Tensor, arg2: &Tensor, f: impl Fn(Tensor, Tensor) -> Op) -> Self {
-        let op = if arg1.track_op() || arg2.track_op() {
-            Some(f(arg1.clone(), arg2.clone()))
+        if arg1.track_op() || arg2.track_op() {
+            Self::Op(f(arg1.clone(), arg2.clone()))
         } else {
-            None
-        };
-        Self(op)
+            Self::None
+        }
     }
 
     pub(crate) fn new3(
@@ -900,33 +902,24 @@ impl BackpropOp {
         arg3: &Tensor,
         f: impl Fn(Tensor, Tensor, Tensor) -> Op,
     ) -> Self {
-        let op = if arg1.track_op() || arg2.track_op() || arg3.track_op() {
-            Some(f(arg1.clone(), arg2.clone(), arg3.clone()))
+        if arg1.track_op() || arg2.track_op() || arg3.track_op() {
+            Self::Op(f(arg1.clone(), arg2.clone(), arg3.clone()))
         } else {
-            None
-        };
-        Self(op)
+            Self::None
+        }
     }
 
     pub(crate) fn new<A: AsRef<Tensor>>(args: &[A], f: impl Fn(Vec<Tensor>) -> Op) -> Self {
-        let op = if args.iter().any(|arg| arg.as_ref().track_op()) {
+        if args.iter().any(|arg| arg.as_ref().track_op()) {
             let args: Vec<Tensor> = args.iter().map(|arg| arg.as_ref().clone()).collect();
-            Some(f(args))
+            Self::Op(f(args))
         } else {
-            None
-        };
-        Self(op)
+            Self::None
+        }
     }
 
     pub(crate) fn is_none(&self) -> bool {
-        self.0.is_none()
-    }
-}
-
-impl std::ops::Deref for BackpropOp {
-    type Target = Option<Op>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        matches!(self, Self::None)
     }
 }
 
