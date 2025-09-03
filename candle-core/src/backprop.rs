@@ -143,8 +143,8 @@ fn walk<'a>(
                 }
                 Op::Reduce(_, ReduceOp::ArgMin | ReduceOp::ArgMax, _) => nodes,
             },
-            BackpropOp::Replay(replayer) => {
-                replayer.input().iter().fold(nodes, |nodes, arg| {
+            BackpropOp::Replay { f: _, dependencies } => {
+                dependencies.iter().fold(nodes, |nodes, arg| {
                     let (_tg, nodes) = walk(arg, nodes, already_seen);
                     track_grad = true; // we only would have stored BackpropOp::Replay if we had to track the gradient
                     nodes
@@ -177,18 +177,6 @@ impl Tensor {
         let mut grads = GradStore::new();
         grads.insert(self, self.ones_like()?.contiguous()?);
         while let Some(ref node) = sorted_nodes.pop() {
-            // loop through grads --
-            // - if !track_grad, drop
-            // - if op is non-none, detach
-            grads.0.retain(|id, grad| {
-                if !already_seen[id] {
-                    return false;
-                }
-                if !grad.op().is_none() {
-                    *grad = grad.detach();
-                }
-                true
-            });
             if node.is_variable() {
                 continue;
             }
@@ -731,77 +719,43 @@ impl Tensor {
                         *sum_grad = sum_grad.add(&arg_grad)?
                     }
                 },
-                BackpropOp::Replay(replayer) => {
-                    let res = replayer.replay()?;
-                    let (_, nodes) = walk(&res, sorted_nodes, &mut already_seen);
-                    sorted_nodes = nodes;
+                BackpropOp::Replay { f, dependencies: _ } => {
+                    let res = f()?;
+                    sorted_nodes = walk(&res, sorted_nodes, &mut already_seen).1;
                     grads.insert(&res, grad);
                 }
                 BackpropOp::None => (),
             }
+            grads.clean(&already_seen);
         }
         Ok(grads)
     }
 }
 
-struct Replayer<const N: usize, F> {
-    f: F,
-    input: [Tensor; N],
-}
-
-pub(crate) trait Replayable: Sync + Send {
-    fn input(&self) -> &[Tensor];
-    fn replay(&self) -> Result<Tensor>;
-}
-
-impl<const N: usize, F: Fn([&Tensor; N]) -> Result<Tensor> + Sync + Send> Replayable
-    for Replayer<N, F>
-{
-    fn input(&self) -> &[Tensor] {
-        &self.input
-    }
-
-    fn replay(&self) -> Result<Tensor> {
-        (self.f)(self.input.each_ref())
-    }
-}
-
-pub fn checkpoint<const N: usize>(
-    f: impl Fn([&Tensor; N]) -> Result<Tensor> + Sync + Send + 'static,
-    input: [&Tensor; N],
-) -> Result<Tensor> {
-    let res = f(input)?;
-    let op = if res.op().is_none() {
-        BackpropOp::none()
+pub fn checkpoint(f: impl Fn() -> Result<Tensor> + Sync + Send + 'static) -> Result<Tensor> {
+    let watermark = Tensor::new(0u8, &crate::Device::Cpu)?;
+    let res = f()?;
+    if res.op().is_none() {
+        Ok(res)
     } else {
-        let replayer = Replayer {
-            f,
-            input: input.map(Clone::clone),
+        let (_, mut dependencies) = walk(&res, vec![], &mut HashMap::new());
+        dependencies.retain(|dep| dep.is_older_than(&watermark));
+        let op = BackpropOp::Replay {
+            f: Box::new(f),
+            dependencies,
         };
-        BackpropOp::Replay(Box::new(replayer))
-    };
-    Ok(res.with_op(op))
-}
-
-pub struct Checkpointed<M: Module + Clone + Send + Sync + 'static> {
-    inner: M,
-}
-
-impl<M: Module + Clone + Send + Sync + 'static> Module for Checkpointed<M> {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let inner = self.inner.clone();
-        checkpoint(move |[x]| inner.forward(x), [x])
+        Ok(res.with_op(op))
     }
 }
 
 /// A store for gradients, associating a tensor id to the corresponding gradient tensor, used for back propagation.
 #[derive(Debug)]
-pub struct GradStore(HashMap<TensorId, Tensor>);
+pub struct GradStore(HashMap<TensorId, Tensor>, Vec<TensorId>);
 
 impl GradStore {
     /// Create a new gradient store
     fn new() -> Self {
-        GradStore(HashMap::new())
+        GradStore(HashMap::new(), vec![])
     }
 
     /// Get the gradient tensor corresponding to the given tensor id
@@ -828,6 +782,7 @@ impl GradStore {
     /// insert a tensor of zeroes, with the same shape and type as the given tensors and return it
     fn or_insert(&mut self, tensor: &Tensor) -> Result<&mut Tensor> {
         use std::collections::hash_map::Entry;
+        self.1.push(tensor.id()); // mark dirty
         let grad = match self.0.entry(tensor.id()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -836,6 +791,16 @@ impl GradStore {
             }
         };
         Ok(grad)
+    }
+
+    fn clean(&mut self, to_track: &HashMap<TensorId, bool>) {
+        for id in std::mem::take(&mut self.1) {
+            if !to_track[&id] {
+                self.0.remove(&id);
+            } else if !self.0[&id].op().is_none() {
+                self.0.insert(id, self.0[&id].detach());
+            }
+        }
     }
 
     /// Get the tensor ids of the stored gradient tensors

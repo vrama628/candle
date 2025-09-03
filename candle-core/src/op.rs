@@ -1,7 +1,7 @@
 //! Tensor Opertion Enums and Traits
 //!
 #![allow(clippy::redundant_closure_call)]
-use crate::{backprop::Replayable, Tensor};
+use crate::{Result, Tensor};
 use half::{bf16, f16};
 use num_traits::float::Float;
 
@@ -872,7 +872,10 @@ impl UnaryOpT for Relu {
 pub enum BackpropOp {
     None,
     Op(Op),
-    Replay(Box<dyn Replayable>),
+    Replay {
+        f: Box<dyn Fn() -> Result<Tensor> + Sync + Send>,
+        dependencies: Vec<Tensor>,
+    },
 }
 
 impl BackpropOp {

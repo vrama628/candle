@@ -177,6 +177,10 @@ pub(crate) fn from_storage<S: Into<Shape>>(
 }
 
 impl Tensor {
+    pub(crate) fn is_older_than(&self, other: &Self) -> bool {
+        self.id().0 < other.id().0
+    }
+
     pub(crate) fn ones_impl<S: Into<Shape>>(
         shape: S,
         dtype: DType,
